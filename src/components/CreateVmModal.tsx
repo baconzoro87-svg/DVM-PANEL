@@ -1,11 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { X, Server, Cpu, HardDrive, Disc, ShieldAlert, Info, AlertTriangle } from 'lucide-react';
-import type { OsImageItem, HostResourceInfo } from '../types/index.ts';
+import { X, Server, Cpu, HardDrive, Disc, ShieldAlert, Info, AlertTriangle, UserCheck } from 'lucide-react';
+import type { OsImageItem, HostResourceInfo, UserItem } from '../types/index.ts';
 
 interface CreateVmModalProps {
   isOpen: boolean;
   images: OsImageItem[];
   hostResources?: HostResourceInfo | null;
+  currentUser?: UserItem | null;
   onClose: () => void;
   onVmCreated: () => void;
 }
@@ -14,11 +15,15 @@ export const CreateVmModal: React.FC<CreateVmModalProps> = ({
   isOpen,
   images,
   hostResources: propHostResources,
+  currentUser,
   onClose,
   onVmCreated,
 }) => {
   const [name, setName] = useState('');
-  const [selectedImage, setSelectedImage] = useState('ubuntu:24.04');
+  const [selectedImage, setSelectedImage] = useState('nobitaa/ubuntu:24');
+  const [targetUserId, setTargetUserId] = useState<string>('');
+  const [usersList, setUsersList] = useState<UserItem[]>([]);
+  const [usersLoading, setUsersLoading] = useState(false);
   
   // Custom CPU input
   const [cpu, setCpu] = useState<number>(2);
@@ -39,7 +44,11 @@ export const CreateVmModal: React.FC<CreateVmModalProps> = ({
 
   useEffect(() => {
     if (isOpen) {
-      fetch('/api/v1/resources')
+      const token = localStorage.getItem('dvm_token');
+
+      fetch('/api/v1/resources', {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      })
         .then(res => res.json())
         .then(data => {
           if (data.success && data.data) {
@@ -47,8 +56,28 @@ export const CreateVmModal: React.FC<CreateVmModalProps> = ({
           }
         })
         .catch(() => {});
+
+      if (currentUser?.role === 'admin') {
+        setUsersLoading(true);
+        fetch('/api/v1/admin/users', {
+          headers: token ? { Authorization: `Bearer ${token}` } : {}
+        })
+          .then(res => res.json())
+          .then(data => {
+            if (data.success && Array.isArray(data.data)) {
+              setUsersList(data.data);
+              if (data.data.length > 0) {
+                // Default to first user or currentUser
+                const defaultTarget = data.data.find((u: UserItem) => u.id === currentUser.id) || data.data[0];
+                setTargetUserId(defaultTarget.id);
+              }
+            }
+          })
+          .catch(() => {})
+          .finally(() => setUsersLoading(false));
+      }
     }
-  }, [isOpen]);
+  }, [isOpen, currentUser]);
 
   if (!isOpen) return null;
 
@@ -101,15 +130,21 @@ export const CreateVmModal: React.FC<CreateVmModalProps> = ({
         cpu,
         ram_mb: totalRamMb,
         disk_gb: totalDiskGb,
-        notes: notes.trim()
+        notes: notes.trim(),
+        target_user_id: targetUserId || currentUser?.id
       };
       if (sshPort && parseInt(sshPort, 10)) {
         payload.ssh_port = parseInt(sshPort, 10);
       }
 
-      const res = await fetch('/api/v1/vms', {
+      const token = localStorage.getItem('dvm_token');
+      const endpoint = currentUser?.role === 'admin' ? '/api/v1/admin/vms' : '/api/v1/vms';
+      const res = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {})
+        },
         body: JSON.stringify(payload)
       });
 
@@ -182,6 +217,33 @@ export const CreateVmModal: React.FC<CreateVmModalProps> = ({
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
+          {currentUser?.role === 'admin' && (
+            <div className="p-3 bg-rose-950/20 border border-rose-900/40 rounded-xl">
+              <label className="block text-xs font-semibold text-rose-300 uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
+                <UserCheck className="w-3.5 h-3.5 text-rose-400" />
+                Assign VPS To Registered User <span className="text-rose-500">*</span>
+              </label>
+              {usersLoading ? (
+                <div className="text-xs text-slate-400 py-1">Loading registered user accounts...</div>
+              ) : (
+                <select
+                  value={targetUserId}
+                  onChange={(e) => setTargetUserId(e.target.value)}
+                  className="w-full px-3 py-2 bg-[#090A0F] border border-rose-900/50 rounded-xl text-xs text-white focus:outline-none focus:border-rose-500 font-medium"
+                >
+                  {usersList.map(u => (
+                    <option key={u.id} value={u.id}>
+                      {u.username} ({u.email}) — [{u.role.toUpperCase()}]
+                    </option>
+                  ))}
+                </select>
+              )}
+              <p className="text-[11px] text-slate-400 mt-1">
+                Each user can own at most 1 active VPS. Admin can allocate and deploy on behalf of any registered user.
+              </p>
+            </div>
+          )}
+
           <div>
             <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
               Hostname / VM Identifier <span className="text-rose-500">*</span>

@@ -1,3 +1,38 @@
+export type UserRole = 'admin' | 'user';
+
+export interface UserItem {
+  id: string;
+  username: string;
+  email: string;
+  role: UserRole;
+  status: 'active' | 'suspended';
+  must_change_password: boolean;
+  assigned_slots: number;
+  vms_count?: number;
+  created_at?: string;
+}
+
+export interface AutoDeploySettings {
+  autodeploy_enabled: boolean;
+  total_slots: number;
+  slot_default_cpu: number;
+  slot_default_ram_mb: number;
+  slot_default_disk_gb: number;
+  allowed_templates: string[];
+  deployment_limits?: {
+    max_slots_per_user?: number;
+    allow_custom_specs?: boolean;
+  };
+}
+
+export interface UserDeployStatus {
+  allowed: boolean;
+  reason?: string;
+  assigned_slots?: number;
+  deployed_vms?: number;
+  available_slots?: number;
+}
+
 export type ApiPermission =
   | 'vms.read'
   | 'vms.create'

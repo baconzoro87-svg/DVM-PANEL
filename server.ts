@@ -1,10 +1,13 @@
 import express from 'express';
+import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import cookieParser from 'cookie-parser';
 import { initDatabase } from './server/db.ts';
 import { requestLogger } from './server/logger.ts';
 import apiV1Router from './server/routes/apiV1.ts';
+import { setupTerminalWebSocketServer } from './server/terminal.ts';
 
 dotenv.config();
 
@@ -21,6 +24,7 @@ initDatabase();
 // Parsers & Middlewares
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
 // Request logging for API telemetry & audit
 app.use(requestLogger);
@@ -74,9 +78,13 @@ async function startServer() {
     });
   });
 
-  app.listen(port, '0.0.0.0', () => {
+  const server = http.createServer(app);
+  setupTerminalWebSocketServer(server);
+
+  server.listen(port, '0.0.0.0', () => {
     console.log(`[BusterNodes DVM Panel] Server listening on http://0.0.0.0:${port}`);
     console.log(`[BusterNodes DVM Panel] REST API available at http://0.0.0.0:${port}/api/v1`);
+    console.log(`[BusterNodes DVM Panel] Interactive Web Console attached at ws://0.0.0.0:${port}/ws/console/:vmId`);
     console.log(`[BusterNodes DVM Panel] Process Manager: Non-systemd (PM2 / Docker compatible)`);
   });
 }

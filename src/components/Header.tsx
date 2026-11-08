@@ -1,19 +1,23 @@
 import React from 'react';
-import { Menu, Plus, KeyRound, Server, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Menu, Plus, KeyRound, Server, CheckCircle2, AlertCircle, LogOut, Shield } from 'lucide-react';
 import type { ActiveTab } from './Sidebar.tsx';
-import type { SystemStatusData } from '../types/index.ts';
+import type { SystemStatusData, UserItem } from '../types/index.ts';
 
 interface HeaderProps {
   activeTab: ActiveTab;
   onOpenMobileSidebar: () => void;
   systemStatus: SystemStatusData | null;
   onOpenCreateVm: () => void;
+  currentUser?: UserItem | null;
+  onLogout?: () => void;
 }
 
 const TAB_TITLES: Record<ActiveTab, { section: string; title: string }> = {
   vms: { section: 'Virtualization Fleet', title: 'Virtual Machines' },
+  autodeploy: { section: 'Admin Subsystems', title: 'AutoDeploy & Slot Policy' },
+  users: { section: 'Admin Subsystems', title: 'User Account Management' },
   images: { section: 'Virtualization Fleet', title: 'OS Templates & Images' },
-  api_integration: { section: 'Admin Settings', title: 'API Integration' },
+  api_integration: { section: 'Admin Subsystems', title: 'API Integration & Bot Key' },
   diagnostics: { section: 'System & Architecture', title: 'Host & Docker Diagnostics' },
   install_guide: { section: 'System & Architecture', title: 'No-Systemd Deployment Guide' },
 };
@@ -23,6 +27,8 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenMobileSidebar,
   systemStatus,
   onOpenCreateVm,
+  currentUser,
+  onLogout
 }) => {
   const current = TAB_TITLES[activeTab] || { section: 'Dashboard', title: 'Overview' };
   const isDockerLive = systemStatus?.docker.available;
@@ -33,7 +39,7 @@ export const Header: React.FC<HeaderProps> = ({
       <div className="flex items-center gap-3">
         <button
           onClick={onOpenMobileSidebar}
-          className="lg:hidden p-2 text-slate-400 hover:text-white rounded-lg hover:bg-white/5"
+          className="lg:hidden p-2 text-slate-400 hover:text-white rounded-lg hover:bg-white/5 cursor-pointer"
           aria-label="Open Navigation Menu"
         >
           <Menu className="w-5 h-5" />
@@ -68,15 +74,28 @@ export const Header: React.FC<HeaderProps> = ({
           <span>Made by Azmal</span>
         </div>
 
-        {/* Action Button: Deploy VM */}
-        <button
-          onClick={onOpenCreateVm}
-          className="px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-rose-700 hover:bg-rose-600 text-white transition-all flex items-center gap-1.5 shadow-md shadow-rose-950/40"
-        >
-          <Plus className="w-3.5 h-3.5" />
-          <span className="hidden sm:inline">Deploy VM</span>
-          <span className="sm:hidden">VM</span>
-        </button>
+        {/* Action Button: Deploy VM (Admin Only) */}
+        {currentUser?.role === 'admin' && (
+          <button
+            onClick={onOpenCreateVm}
+            className="px-3.5 py-1.5 text-xs font-semibold rounded-lg bg-gradient-to-r from-rose-700 to-pink-700 hover:from-rose-600 hover:to-pink-600 text-white transition-all flex items-center gap-1.5 shadow-md shadow-rose-950/40 cursor-pointer"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Deploy VPS</span>
+            <span className="sm:hidden">Deploy</span>
+          </button>
+        )}
+
+        {/* User profile / Logout */}
+        {currentUser && onLogout && (
+          <button
+            onClick={onLogout}
+            title="Sign Out"
+            className="p-1.5 text-slate-400 hover:text-rose-400 rounded-lg hover:bg-white/5 transition-colors cursor-pointer"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
+        )}
       </div>
     </header>
   );

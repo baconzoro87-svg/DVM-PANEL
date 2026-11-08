@@ -28,7 +28,29 @@ export interface User {
   username: string;
   email: string;
   role: 'admin' | 'user';
+  status: 'active' | 'suspended';
+  must_change_password: number; // 1 = must change on next login, 0 = normal
+  assigned_slots: number;
   created_at: string;
+}
+
+export interface AutoDeploySettings {
+  autodeploy_enabled: boolean;
+  total_slots: number;
+  occupied_slots: number;
+  available_slots: number;
+  slot_default_cpu: number;
+  slot_default_ram_mb: number;
+  slot_default_disk_gb: number;
+  allowed_templates: string[];
+}
+
+export interface SshxSession {
+  vmId: string;
+  url: string;
+  active: boolean;
+  startedAt: string;
+  error?: string;
 }
 
 export interface ApiKeyRecord {

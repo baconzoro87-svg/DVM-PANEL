@@ -1,14 +1,16 @@
 import React from 'react';
 import { Layers, HardDrive, Cpu, CheckCircle2, Plus, Download } from 'lucide-react';
-import type { OsImageItem } from '../types/index.ts';
+import type { OsImageItem, UserItem } from '../types/index.ts';
 
 interface ImagesListProps {
   images: OsImageItem[];
+  currentUser?: UserItem | null;
   onDeployImage: (tag: string) => void;
 }
 
 export const ImagesList: React.FC<ImagesListProps> = ({
   images,
+  currentUser,
   onDeployImage,
 }) => {
   return (
@@ -70,13 +72,19 @@ export const ImagesList: React.FC<ImagesListProps> = ({
               </div>
             </div>
 
-            <button
-              onClick={() => onDeployImage(img.tag)}
-              className="w-full py-2 px-3 rounded-xl bg-white/5 hover:bg-rose-900/50 hover:border-rose-700/50 text-slate-200 hover:text-white border border-white/10 text-xs font-semibold flex items-center justify-center gap-2 transition-all"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Deploy from Template</span>
-            </button>
+            {currentUser?.role === 'admin' ? (
+              <button
+                onClick={() => onDeployImage(img.tag)}
+                className="w-full py-2 px-3 rounded-xl bg-white/5 hover:bg-rose-900/50 hover:border-rose-700/50 text-slate-200 hover:text-white border border-white/10 text-xs font-semibold flex items-center justify-center gap-2 transition-all cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Deploy from Template</span>
+              </button>
+            ) : (
+              <div className="w-full py-2 px-3 rounded-xl bg-white/[0.02] border border-white/5 text-[11px] text-slate-500 text-center font-mono">
+                Admin-Controlled Template
+              </div>
+            )}
           </div>
         ))}
       </div>

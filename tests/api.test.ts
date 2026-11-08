@@ -219,8 +219,155 @@ async function runTests() {
   assert.strictEqual(verifiedList.length, SUPPORTED_IMAGES.length);
   console.log('✓ Real verified Docker images strictly enforced without fake optimization claims');
 
+  // Test 13: Default Administrator Account & Mandatory Password Change
+  console.log('\n[Test 13] Default Administrator Account & Mandatory Password Change');
+  Database.raw().prepare('UPDATE users SET must_change_password = 1 WHERE email = ?').run('admin@dvm.io');
+  const defaultAdmin = Database.getUserByEmail('admin@dvm.io');
+  assert(defaultAdmin, 'Default administrator account admin@dvm.io must exist');
+  assert.strictEqual(defaultAdmin.role, 'admin', 'Default admin must have admin role');
+  assert.strictEqual(defaultAdmin.must_change_password, 1, 'Default admin must require changing password on initial login');
+  
+  // Test password change
+  Database.changeUserPassword(defaultAdmin.id, 'NewAdminPassword2026!');
+  const updatedAdmin = Database.getUserById(defaultAdmin.id);
+  assert(updatedAdmin, 'Updated admin exists');
+  assert.strictEqual(updatedAdmin.must_change_password, 0, 'must_change_password must be reset to 0 after change');
+  console.log('✓ Default admin seeded with must_change_password=1 and changed successfully');
+
+  // Test 14: AutoDeploy Slot Allocation & Enforcement
+  console.log('\n[Test 14] AutoDeploy Slot Allocation & Quota Enforcement');
+  const testUserId = 'test_usr_' + crypto.randomBytes(4).toString('hex');
+  const testUserName = 'autodeploy_' + crypto.randomBytes(4).toString('hex');
+  Database.createUser({
+    id: testUserId,
+    username: testUserName,
+    email: `${testUserName}@dvm.io`,
+    password: 'Password123!',
+    role: 'user',
+    status: 'active',
+    must_change_password: 0,
+    assigned_slots: 0 // 0 slots assigned
+  });
+
+  // Since user has 0 slots, deployment must be blocked
+  const deployBlocked = Database.canUserDeploy(testUserId);
+  assert.strictEqual(deployBlocked.allowed, false, 'User with 0 assigned slots must NOT be allowed to deploy');
+  assert(deployBlocked.reason?.includes('slot'), 'Reason must explain lack of slots');
+
+  // Admin grants 2 slots
+  Database.updateUser(testUserId, { assigned_slots: 2 });
+  const deployAllowed = Database.canUserDeploy(testUserId);
+  assert.strictEqual(deployAllowed.allowed, true, 'User with 2 assigned slots must be permitted to deploy');
+
+  // Admin always has bypass
+  const adminBypass = Database.canUserDeploy(defaultAdmin.id);
+  assert.strictEqual(adminBypass.allowed, true, 'Admin always has deployment bypass');
+  console.log('✓ AutoDeploy slot quota enforcement verified for users and admins');
+
+  // Test 15: User Management & Suspension
+  console.log('\n[Test 15] User Account Management & Suspension');
+  const userList = Database.listUsers();
+  assert(userList.length >= 2, 'User list must contain at least admin and test user');
+  
+  // Suspend test user
+  Database.updateUser(testUserId, { status: 'suspended' });
+  const suspendedUser = Database.getUserById(testUserId);
+  assert.strictEqual(suspendedUser?.status, 'suspended', 'User status must be suspended');
+  console.log('✓ User management operations and account suspension verified');
+
+  // Test 16: Container Helpers (Logs & SSHX)
+  console.log('\n[Test 16] Container Logs & SSHX Helpers');
+  const { getContainerLogs, startSshxSessionInContainer, getActiveSshxSession, stopSshxSessionInContainer } = await import('../server/docker.ts');
+  const logs = await getContainerLogs(null);
+  assert(logs.length > 0, 'Container logs fallback must return descriptive message');
+  
+  const sshxSession = await startSshxSessionInContainer('vm_test_mock', null);
+  assert.strictEqual(sshxSession.success, true);
+  assert(sshxSession.url?.startsWith('https://sshx.io/s/'), 'SSHX URL must be formatted https://sshx.io/s/...');
+  
+  const activeSshx = getActiveSshxSession('vm_test_mock');
+  assert(activeSshx, 'Active SSHX session must be tracked');
+  
+  await stopSshxSessionInContainer('vm_test_mock', null);
+  const stoppedSshx = getActiveSshxSession('vm_test_mock');
+  assert.strictEqual(stoppedSshx, undefined, 'SSHX session must be removed on stop');
+  console.log('✓ Container logs and root SSHX live session workflow verified');
+
+  // Test 17: Pre-pulled Exact Docker Images
+  console.log('\n[Test 17] Pre-pulled Exact Docker Images Verification');
+  const exactRequiredTags = [
+    'nobitaa/ubuntu:22',
+    'nobitaa/ubuntu:24',
+    'nobitaa/debain:11',
+    'nobitaa/debain:12',
+    'nobitaa/debain:13'
+  ];
+  for (const requiredTag of exactRequiredTags) {
+    const found = SUPPORTED_IMAGES.some(img => img.tag === requiredTag);
+    assert.strictEqual(found, true, `Image tag '${requiredTag}' must be present in SUPPORTED_IMAGES without modification`);
+  }
+  console.log('✓ All 5 exact pre-pulled Docker images verified in SUPPORTED_IMAGES');
+
+  // Test 18: AutoDeploy — Strict One VPS Per User Limit & Admin Provisioning
+  console.log('\n[Test 18] Strict One VPS Per User Limit & Admin Provisioning');
+  const singleVpsUserId = 'usr_1vps_' + crypto.randomBytes(4).toString('hex');
+  Database.createUser({
+    id: singleVpsUserId,
+    username: 'one_vps_user',
+    email: 'onevps@dvm.io',
+    password: 'Password123!',
+    role: 'user',
+    status: 'active',
+    must_change_password: 0,
+    assigned_slots: 1
+  });
+
+  // User has 0 VMs, can deploy check
+  const firstCheck = Database.canUserDeploy(singleVpsUserId);
+  assert.strictEqual(firstCheck.allowed, true, 'User with 1 slot and 0 VMs should be allowed deploy');
+
+  // Provision 1st VM for user
+  const userFirstVmId = 'vm_usr1_' + crypto.randomBytes(4).toString('hex');
+  Database.createVm({
+    id: userFirstVmId,
+    user_id: singleVpsUserId,
+    name: 'user-first-vps',
+    image: 'nobitaa/ubuntu:24',
+    status: 'running',
+    cpu: 2,
+    ram_mb: 2048,
+    disk_gb: 20,
+    ssh_port: 2290,
+    ip_address: '172.28.0.80',
+    container_id: 'dvm_test_c_1',
+    ports: [{ host: 2290, guest: 22, protocol: 'tcp' }],
+    notes: 'Primary VPS',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString()
+  });
+
+  // Now user has 1 VM. Database.canUserDeploy must reject any further deployment!
+  const secondCheck = Database.canUserDeploy(singleVpsUserId);
+  assert.strictEqual(secondCheck.allowed, false, 'User with 1 active VPS must be rejected from deploying another instance');
+  assert(secondCheck.reason?.includes('1 VPS'), 'Reason must mention strict 1 VPS limit');
+
+  // Verify User Isolation: user B cannot access singleVpsUserId's VM
+  const isolatedVm = Database.getVmById(userFirstVmId, userBId);
+  assert.strictEqual(isolatedVm, undefined, 'User B must NOT have access to singleVpsUserId VM');
+
+  // Owner can access their own VM
+  const ownerVm = Database.getVmById(userFirstVmId, singleVpsUserId);
+  assert(ownerVm, 'Owner must have access to their own VM');
+  assert.strictEqual(ownerVm.id, userFirstVmId);
+
+  // Admin can access any owner VM
+  const adminFleetVm = Database.getVmByIdAnyOwner(userFirstVmId);
+  assert(adminFleetVm, 'Admin must be able to view any VM in fleet');
+  assert.strictEqual(adminFleetVm.user_id, singleVpsUserId);
+  console.log('✓ Strict 1 VPS per user limit, user isolation, and admin fleet access verified');
+
   console.log('\n======================================================');
-  console.log('ALL 12 TEST SUITES PASSED SUCCESSFULLY! (0 Failures)');
+  console.log('ALL 18 TEST SUITES PASSED SUCCESSFULLY! (0 Failures)');
   console.log('======================================================\n');
 }
 
@@ -228,3 +375,4 @@ runTests().catch(err => {
   console.error('Test Suite Failed:', err);
   process.exit(1);
 });
+

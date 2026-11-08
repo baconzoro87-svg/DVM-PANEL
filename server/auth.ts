@@ -1,7 +1,10 @@
 import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
 import type { Request, Response, NextFunction } from 'express';
 import { Database } from './db.ts';
 import type { ApiKeyRecord, User } from './types.ts';
+
+const JWT_SECRET = process.env.JWT_SECRET || 'busternodes_dvm_panel_secret_jwt_key_2026';
 
 // Extend Express Request type
 declare global {
@@ -12,6 +15,40 @@ declare global {
       authMethod?: 'api_key' | 'panel_session';
     }
   }
+}
+
+export function createJwtToken(user: User): string {
+  return jwt.sign(
+    { userId: user.id, email: user.email, role: user.role },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  );
+}
+
+export function verifyJwtToken(token: string): { userId: string; email: string; role: 'admin' | 'user' } | null {
+  try {
+    return jwt.verify(token, JWT_SECRET) as any;
+  } catch {
+    return null;
+  }
+}
+
+export function hashPassword(password: string): string {
+  return crypto.createHash('sha256').update(password.trim()).digest('hex');
+}
+
+export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  if (req.user?.role !== 'admin') {
+    res.status(403).json({
+      success: false,
+      error: {
+        code: 'FORBIDDEN',
+        message: 'This operation requires administrator privileges'
+      }
+    });
+    return;
+  }
+  next();
 }
 
 export function generateSecureAdminApiKey(): { fullKey: string; keyPrefix: string; keyHash: string } {
@@ -45,25 +82,43 @@ export function hashApiKey(key: string): string {
  */
 export function authenticateApiKey(options: { allowSessionFallback?: boolean } = {}) {
   return (req: Request, res: Response, next: NextFunction): void => {
+    let token: string | undefined;
+
     const authHeader = req.headers.authorization;
-
     if (authHeader && authHeader.startsWith('Bearer ')) {
-      const token = authHeader.substring(7).trim();
+      token = authHeader.substring(7).trim();
+    } else if (req.headers.cookie) {
+      const match = req.headers.cookie.match(/dvm_token=([^;]+)/);
+      if (match) token = decodeURIComponent(match[1]).trim();
+    } else if (typeof req.query.token === 'string') {
+      token = req.query.token.trim();
+    }
 
-      if (!token) {
-        res.status(401).json({
-          success: false,
-          error: {
-            code: 'UNAUTHORIZED',
-            message: 'Bearer token format invalid or missing token string'
+    if (token) {
+      // 1. Check if token is a valid JWT session for logged-in users/admins
+      const jwtPayload = verifyJwtToken(token);
+      if (jwtPayload && jwtPayload.userId) {
+        const user = Database.getUserById(jwtPayload.userId);
+        if (user) {
+          if (user.status === 'suspended') {
+            res.status(403).json({
+              success: false,
+              error: {
+                code: 'ACCOUNT_SUSPENDED',
+                message: 'Your account has been suspended by an administrator'
+              }
+            });
+            return;
           }
-        });
-        return;
+          req.user = user;
+          req.authMethod = 'panel_session';
+          next();
+          return;
+        }
       }
 
+      // 2. Check if token is the Single Master Admin API Key
       const hash = hashApiKey(token);
-
-      // Check Single Admin API Key first
       const adminKey = Database.getAdminApiKey();
       if (adminKey && adminKey.key_hash === hash) {
         if (adminKey.status === 'revoked') {
@@ -77,7 +132,6 @@ export function authenticateApiKey(options: { allowSessionFallback?: boolean } =
           return;
         }
 
-        // Update last used timestamp
         Database.updateAdminApiKeyLastUsed();
         const adminUser = Database.getDefaultAdmin();
         req.user = adminUser;
@@ -103,69 +157,66 @@ export function authenticateApiKey(options: { allowSessionFallback?: boolean } =
         return;
       }
 
-      // Check legacy multi-key table if applicable
+      // 3. Check legacy multi-key table if applicable
       const keyRecord = Database.getApiKeyByHash(hash);
-
-      if (!keyRecord) {
-        res.status(401).json({
-          success: false,
-          error: {
-            code: 'INVALID_API_KEY',
-            message: 'The provided API key does not exist or has been regenerated'
-          }
-        });
-        return;
-      }
-
-      if (keyRecord.is_revoked) {
-        res.status(401).json({
-          success: false,
-          error: {
-            code: 'KEY_REVOKED',
-            message: 'This API key has been revoked and cannot be used'
-          }
-        });
-        return;
-      }
-
-      if (keyRecord.expires_at) {
-        const expiryTime = new Date(keyRecord.expires_at).getTime();
-        if (expiryTime <= Date.now()) {
+      if (keyRecord) {
+        if (keyRecord.is_revoked) {
           res.status(401).json({
             success: false,
             error: {
-              code: 'KEY_EXPIRED',
-              message: 'This API key expired on ' + keyRecord.expires_at
+              code: 'KEY_REVOKED',
+              message: 'This API key has been revoked and cannot be used'
             }
           });
           return;
         }
-      }
 
-      // Valid API key
-      const user = Database.getUserById(keyRecord.user_id);
-      if (!user) {
-        res.status(401).json({
-          success: false,
-          error: {
-            code: 'USER_NOT_FOUND',
-            message: 'Associated user account could not be found'
+        if (keyRecord.expires_at) {
+          const expiryTime = new Date(keyRecord.expires_at).getTime();
+          if (expiryTime <= Date.now()) {
+            res.status(401).json({
+              success: false,
+              error: {
+                code: 'KEY_EXPIRED',
+                message: 'This API key expired on ' + keyRecord.expires_at
+              }
+            });
+            return;
           }
-        });
+        }
+
+        const user = Database.getUserById(keyRecord.user_id);
+        if (!user) {
+          res.status(401).json({
+            success: false,
+            error: {
+              code: 'USER_NOT_FOUND',
+              message: 'Associated user account could not be found'
+            }
+          });
+          return;
+        }
+
+        Database.updateKeyLastUsed(keyRecord.id);
+        req.apiKey = keyRecord;
+        req.user = user;
+        req.authMethod = 'api_key';
+        next();
         return;
       }
 
-      // Update last used timestamp
-      Database.updateKeyLastUsed(keyRecord.id);
-
-      req.apiKey = keyRecord;
-      req.user = user;
-      req.authMethod = 'api_key';
-      next();
+      // Invalid token provided
+      res.status(401).json({
+        success: false,
+        error: {
+          code: 'INVALID_CREDENTIALS',
+          message: 'Invalid or expired session token or API key'
+        }
+      });
       return;
     }
 
-    // If session fallback is permitted (e.g. for panel frontend UI calling backend)
+    // Fallback for tests/internal endpoints only if explicitly opted-in
     if (options.allowSessionFallback) {
       const admin = Database.getDefaultAdmin();
       req.user = admin;
@@ -178,7 +229,7 @@ export function authenticateApiKey(options: { allowSessionFallback?: boolean } =
       success: false,
       error: {
         code: 'UNAUTHORIZED',
-        message: 'Missing Authorization header. Use "Authorization: Bearer YOUR_API_KEY"'
+        message: 'Authentication required. Please log in or provide an Authorization Bearer token.'
       }
     });
   };

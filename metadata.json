@@ -2,5 +2,5 @@
   "name": "DVM Panel — BusterNodes",
   "description": "Enterprise Cloud Virtualization & API Management System by BusterNodes. Made by Azmal.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }

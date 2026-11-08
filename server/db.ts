@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import type { User, ApiKeyRecord, ApiLogRecord, VirtualMachine, ApiPermission, AdminApiKeyRecord } from './types.ts';
+import type { User, ApiKeyRecord, ApiLogRecord, VirtualMachine, ApiPermission, AdminApiKeyRecord, AutoDeploySettings } from './types.ts';
 
 const DB_PATH = path.resolve(process.cwd(), 'dvm_panel.sqlite');
 
@@ -109,30 +109,39 @@ export function initDatabase() {
     );
   `);
 
+  // Safe schema migrations for user enhancements
+  try { db.exec("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"); } catch {}
+  try { db.exec("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0"); } catch {}
+  try { db.exec("ALTER TABLE users ADD COLUMN assigned_slots INTEGER NOT NULL DEFAULT 0"); } catch {}
+
   seedInitialData();
 }
 
 function seedInitialData() {
-  // Ensure default admin user exists
-  const checkUser = db.prepare('SELECT id FROM users WHERE username = ?').get('admin') as { id: string } | undefined;
-  let adminId = checkUser?.id;
+  // Ensure default administrator exists (admin@dvm.io / Admin213)
+  const adminEmail = 'admin@dvm.io';
+  const defaultAdminHash = crypto.createHash('sha256').update('Admin213').digest('hex');
 
-  if (!checkUser) {
-    adminId = 'usr_' + crypto.randomBytes(6).toString('hex');
+  const checkAdmin = db.prepare("SELECT id, email, username, password_hash, must_change_password FROM users WHERE email = ? OR username = 'admin'").get(adminEmail) as { id: string; email: string; username: string; password_hash: string; must_change_password: number } | undefined;
+
+  if (checkAdmin) {
+    if (checkAdmin.email !== adminEmail || checkAdmin.username !== 'admin') {
+      db.prepare(`
+        UPDATE users 
+        SET email = ?, username = 'admin', role = 'admin', status = 'active'
+        WHERE id = ?
+      `).run(adminEmail, checkAdmin.id);
+    }
+  } else {
+    const adminId = 'usr_admin_master';
     db.prepare(`
-      INSERT INTO users (id, username, email, password_hash, role, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
-      adminId,
-      'admin',
-      'ops@busternodes.com',
-      crypto.createHash('sha256').update('busternodes-admin-2026').digest('hex'),
-      'admin',
-      new Date().toISOString()
-    );
+      INSERT INTO users (id, username, email, password_hash, role, status, must_change_password, assigned_slots, created_at)
+      VALUES (?, 'admin', ?, ?, 'admin', 'active', 1, 50, ?)
+    `).run(adminId, adminEmail, defaultAdminHash, new Date().toISOString());
   }
 
-  // Ensure default API settings exist
+
+  // Ensure default API & AutoDeploy settings exist
   const defaultSettings: Record<string, string> = {
     'rate_limit_per_minute': '120',
     'sensitive_rate_limit_per_minute': '30',
@@ -141,7 +150,22 @@ function seedInitialData() {
     'allowed_ip_cidrs': '0.0.0.0/0',
     'alert_on_rate_limit': 'true',
     'webhook_alert_url': '',
-    'allow_resource_overcommit': 'false'
+    'allow_resource_overcommit': 'false',
+    'autodeploy_enabled': 'true',
+    'total_slots': '20',
+    'slot_default_cpu': '2',
+    'slot_default_ram_mb': '2048',
+    'allowed_templates': JSON.stringify([
+      'nobitaa/ubuntu:24',
+      'nobitaa/ubuntu:22',
+      'nobitaa/debain:13',
+      'nobitaa/debain:12',
+      'nobitaa/debain:11',
+      'ubuntu:24.04',
+      'ubuntu:22.04',
+      'debian:12',
+      'alpine:3.20'
+    ])
   };
 
   for (const [key, val] of Object.entries(defaultSettings)) {
@@ -170,12 +194,138 @@ export const Database = {
   raw: () => db,
 
   getUserById: (id: string): User | undefined => {
-    return db.prepare('SELECT id, username, email, role, created_at FROM users WHERE id = ?').get(id) as User | undefined;
+    return db.prepare(`
+      SELECT id, username, email, role, 
+             COALESCE(status, 'active') as status, 
+             COALESCE(must_change_password, 0) as must_change_password, 
+             COALESCE(assigned_slots, 0) as assigned_slots, 
+             created_at 
+      FROM users WHERE id = ?
+    `).get(id) as User | undefined;
+  },
+
+  getUserByEmail: (email: string): (User & { password_hash: string }) | undefined => {
+    const normalized = email.trim().toLowerCase();
+    return db.prepare(`
+      SELECT id, username, email, password_hash, role, 
+             COALESCE(status, 'active') as status, 
+             COALESCE(must_change_password, 0) as must_change_password, 
+             COALESCE(assigned_slots, 0) as assigned_slots, 
+             created_at 
+      FROM users WHERE LOWER(email) = ? OR LOWER(username) = ?
+    `).get(normalized, normalized) as (User & { password_hash: string }) | undefined;
+  },
+
+  getUserByUsername: (username: string): (User & { password_hash: string }) | undefined => {
+    return Database.getUserByEmail(username);
+  },
+
+  getUserByIdWithPassword: (id: string): (User & { password_hash: string }) | undefined => {
+    return db.prepare(`
+      SELECT id, username, email, password_hash, role, 
+             COALESCE(status, 'active') as status, 
+             COALESCE(must_change_password, 0) as must_change_password, 
+             COALESCE(assigned_slots, 0) as assigned_slots, 
+             created_at 
+      FROM users WHERE id = ?
+    `).get(id) as (User & { password_hash: string }) | undefined;
+  },
+
+  listUsers: (): (User & { vms_count: number })[] => {
+    const rows = db.prepare(`
+      SELECT u.id, u.username, u.email, u.role, 
+             COALESCE(u.status, 'active') as status, 
+             COALESCE(u.must_change_password, 0) as must_change_password, 
+             COALESCE(u.assigned_slots, 0) as assigned_slots, 
+             u.created_at,
+             COUNT(v.id) as vms_count
+      FROM users u
+      LEFT JOIN vms v ON v.user_id = u.id
+      GROUP BY u.id
+      ORDER BY u.created_at DESC
+    `).all() as any[];
+
+    return rows.map(r => ({
+      ...r,
+      vms_count: Number(r.vms_count || 0)
+    }));
+  },
+
+  createUser: (user: {
+    id?: string;
+    username: string;
+    email: string;
+    password_hash?: string;
+    password?: string;
+    role: 'admin' | 'user';
+    status: 'active' | 'suspended';
+    must_change_password?: number;
+    assigned_slots?: number;
+  }): User => {
+    const userId = user.id || 'usr_' + crypto.randomBytes(6).toString('hex');
+    const hash = user.password_hash || (user.password ? crypto.createHash('sha256').update(user.password).digest('hex') : '');
+    const mustChange = user.must_change_password ?? 0;
+    const slots = user.assigned_slots ?? 0;
+    const createdAt = new Date().toISOString();
+
+    db.prepare(`
+      INSERT INTO users (id, username, email, password_hash, role, status, must_change_password, assigned_slots, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      userId,
+      user.username.trim(),
+      user.email.trim().toLowerCase(),
+      hash,
+      user.role,
+      user.status,
+      mustChange,
+      slots,
+      createdAt
+    );
+
+    return {
+      id: userId,
+      username: user.username.trim(),
+      email: user.email.trim().toLowerCase(),
+      role: user.role,
+      status: user.status,
+      must_change_password: mustChange,
+      assigned_slots: slots,
+      created_at: createdAt
+    };
+  },
+
+
+  updateUser: (id: string, updates: { role?: 'admin' | 'user'; status?: 'active' | 'suspended'; assigned_slots?: number }): boolean => {
+    const fields: string[] = [];
+    const values: any[] = [];
+    if (updates.role) { fields.push('role = ?'); values.push(updates.role); }
+    if (updates.status) { fields.push('status = ?'); values.push(updates.status); }
+    if (typeof updates.assigned_slots === 'number') { fields.push('assigned_slots = ?'); values.push(updates.assigned_slots); }
+
+    if (fields.length === 0) return true;
+    values.push(id);
+    const res = db.prepare(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+    return res.changes > 0;
+  },
+
+  deleteUser: (id: string): boolean => {
+    const res = db.prepare('DELETE FROM users WHERE id = ?').run(id);
+    return res.changes > 0;
+  },
+
+  changeUserPassword: (userId: string, newHash: string): boolean => {
+    const res = db.prepare('UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?').run(newHash, userId);
+    return res.changes > 0;
   },
 
   getDefaultAdmin: (): User => {
-    const user = db.prepare('SELECT id, username, email, role, created_at FROM users WHERE username = ?').get('admin') as User | undefined;
-    if (!user) throw new Error('Default admin not found');
+    const user = Database.getUserByEmail('admin@dvm.io') || Database.getUserById('usr_admin_master');
+    if (!user) {
+      const fallback = db.prepare("SELECT * FROM users WHERE role = 'admin' LIMIT 1").get() as User | undefined;
+      if (fallback) return fallback;
+      throw new Error('Default admin not found');
+    }
     return user;
   },
 
@@ -441,6 +591,19 @@ export const Database = {
   },
 
   // Virtual Machine Queries
+  listAllVms: (): (VirtualMachine & { owner_email: string; owner_username: string })[] => {
+    const rows = db.prepare(`
+      SELECT v.*, u.email as owner_email, u.username as owner_username
+      FROM vms v
+      LEFT JOIN users u ON u.id = v.user_id
+      ORDER BY v.created_at DESC
+    `).all() as any[];
+    return rows.map(r => ({
+      ...r,
+      ports: JSON.parse(r.ports || '[]')
+    }));
+  },
+
   listVms: (userId: string): VirtualMachine[] => {
     const rows = db.prepare('SELECT * FROM vms WHERE user_id = ? ORDER BY created_at DESC').all(userId) as any[];
     return rows.map(r => ({
@@ -451,6 +614,20 @@ export const Database = {
 
   getVmById: (id: string, userId: string): VirtualMachine | undefined => {
     const row = db.prepare('SELECT * FROM vms WHERE id = ? AND user_id = ?').get(id, userId) as any;
+    if (!row) return undefined;
+    return {
+      ...row,
+      ports: JSON.parse(row.ports || '[]')
+    };
+  },
+
+  getVmByIdAnyOwner: (id: string): (VirtualMachine & { owner_email?: string }) | undefined => {
+    const row = db.prepare(`
+      SELECT v.*, u.email as owner_email 
+      FROM vms v 
+      LEFT JOIN users u ON u.id = v.user_id 
+      WHERE v.id = ?
+    `).get(id) as any;
     if (!row) return undefined;
     return {
       ...row,
@@ -481,16 +658,54 @@ export const Database = {
     );
   },
 
-  updateVmStatus: (id: string, userId: string, status: 'running' | 'stopped' | 'restarting' | 'error') => {
-    db.prepare(`
-      UPDATE vms
-      SET status = ?, updated_at = ?
-      WHERE id = ? AND user_id = ?
-    `).run(status, new Date().toISOString(), id, userId);
+  updateVmStatus: (id: string, userId: string | undefined, status: 'running' | 'stopped' | 'restarting' | 'error') => {
+    if (userId) {
+      db.prepare(`
+        UPDATE vms
+        SET status = ?, updated_at = ?
+        WHERE id = ? AND user_id = ?
+      `).run(status, new Date().toISOString(), id, userId);
+    } else {
+      db.prepare(`
+        UPDATE vms
+        SET status = ?, updated_at = ?
+        WHERE id = ?
+      `).run(status, new Date().toISOString(), id);
+    }
   },
 
-  deleteVm: (id: string, userId: string): boolean => {
-    const res = db.prepare('DELETE FROM vms WHERE id = ? AND user_id = ?').run(id, userId);
+  updateVmContainerInfo: (id: string, containerId: string | null, ipAddress: string) => {
+    db.prepare(`
+      UPDATE vms
+      SET container_id = ?, ip_address = ?, updated_at = ?
+      WHERE id = ?
+    `).run(containerId, ipAddress, new Date().toISOString(), id);
+  },
+
+  updateVmRecord: (id: string, updates: Partial<VirtualMachine>): boolean => {
+    const fields: string[] = [];
+    const values: any[] = [];
+    if (updates.container_id !== undefined) { fields.push('container_id = ?'); values.push(updates.container_id); }
+    if (updates.image !== undefined) { fields.push('image = ?'); values.push(updates.image); }
+    if (updates.status !== undefined) { fields.push('status = ?'); values.push(updates.status); }
+    if (updates.ip_address !== undefined) { fields.push('ip_address = ?'); values.push(updates.ip_address); }
+    if (updates.cpu !== undefined) { fields.push('cpu = ?'); values.push(updates.cpu); }
+    if (updates.ram_mb !== undefined) { fields.push('ram_mb = ?'); values.push(updates.ram_mb); }
+    if (updates.disk_gb !== undefined) { fields.push('disk_gb = ?'); values.push(updates.disk_gb); }
+    if (updates.ssh_port !== undefined) { fields.push('ssh_port = ?'); values.push(updates.ssh_port); }
+    fields.push('updated_at = ?');
+    values.push(new Date().toISOString());
+    values.push(id);
+    const res = db.prepare(`UPDATE vms SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+    return res.changes > 0;
+  },
+
+  deleteVm: (id: string, userId?: string): boolean => {
+    if (userId) {
+      const res = db.prepare('DELETE FROM vms WHERE id = ? AND user_id = ?').run(id, userId);
+      return res.changes > 0;
+    }
+    const res = db.prepare('DELETE FROM vms WHERE id = ?').run(id);
     return res.changes > 0;
   },
 
@@ -498,6 +713,100 @@ export const Database = {
     const maxRow = db.prepare('SELECT MAX(ssh_port) as max_port FROM vms').get() as { max_port: number | null };
     const maxPort = maxRow.max_port || 2200;
     return Math.max(maxPort + 1, 2201);
+  },
+
+  // AutoDeploy Subsystem
+  getAutoDeploySettings: (): AutoDeploySettings => {
+    const enabled = Database.getSetting('autodeploy_enabled', 'true') === 'true';
+    const totalSlots = parseInt(Database.getSetting('total_slots', '20'), 10);
+    const defaultCpu = parseInt(Database.getSetting('slot_default_cpu', '2'), 10);
+    const defaultRamMb = parseInt(Database.getSetting('slot_default_ram_mb', '2048'), 10);
+    const defaultDiskGb = parseInt(Database.getSetting('slot_default_disk_gb', '20'), 10);
+    let allowedTemplates: string[] = ['ubuntu:24.04', 'ubuntu:22.04', 'debian:12', 'alpine:3.20', 'rockylinux:9', 'almalinux:9'];
+    try {
+      const raw = Database.getSetting('allowed_templates', '');
+      if (raw) allowedTemplates = JSON.parse(raw);
+    } catch {}
+
+    const occupiedSlots = (db.prepare('SELECT COUNT(*) as count FROM vms').get() as { count: number }).count;
+    const availableSlots = Math.max(0, totalSlots - occupiedSlots);
+
+    return {
+      autodeploy_enabled: enabled,
+      total_slots: totalSlots,
+      occupied_slots: occupiedSlots,
+      available_slots: availableSlots,
+      slot_default_cpu: defaultCpu,
+      slot_default_ram_mb: defaultRamMb,
+      slot_default_disk_gb: defaultDiskGb,
+      allowed_templates: allowedTemplates
+    };
+  },
+
+  updateAutoDeploySettings: (updates: Partial<{
+    autodeploy_enabled: boolean;
+    total_slots: number;
+    slot_default_cpu: number;
+    slot_default_ram_mb: number;
+    slot_default_disk_gb: number;
+    allowed_templates: string[];
+  }>) => {
+    if (typeof updates.autodeploy_enabled === 'boolean') {
+      Database.updateSetting('autodeploy_enabled', updates.autodeploy_enabled ? 'true' : 'false');
+    }
+    if (typeof updates.total_slots === 'number') {
+      Database.updateSetting('total_slots', updates.total_slots.toString());
+    }
+    if (typeof updates.slot_default_cpu === 'number') {
+      Database.updateSetting('slot_default_cpu', updates.slot_default_cpu.toString());
+    }
+    if (typeof updates.slot_default_ram_mb === 'number') {
+      Database.updateSetting('slot_default_ram_mb', updates.slot_default_ram_mb.toString());
+    }
+    if (typeof updates.slot_default_disk_gb === 'number') {
+      Database.updateSetting('slot_default_disk_gb', updates.slot_default_disk_gb.toString());
+    }
+    if (Array.isArray(updates.allowed_templates)) {
+      Database.updateSetting('allowed_templates', JSON.stringify(updates.allowed_templates));
+    }
+  },
+
+  canUserDeploy: (userId: string): { allowed: boolean; reason?: string } => {
+    const user = Database.getUserById(userId);
+    if (!user) return { allowed: false, reason: 'User account not found' };
+    if (user.status === 'suspended') return { allowed: false, reason: 'Your account has been suspended by an administrator' };
+    if (user.role === 'admin') return { allowed: true };
+
+    // 1. Check if user already owns 1 VPS instance (Strict 1 VPS per user policy)
+    const userVmCount = (db.prepare('SELECT COUNT(*) as count FROM vms WHERE user_id = ?').get(userId) as { count: number }).count;
+    if (userVmCount >= 1) {
+      return {
+        allowed: false,
+        reason: 'Each user is limited to a maximum of 1 VPS instance. You already have an active VPS deployed. Contact an administrator if you need to remove or reassign it.'
+      };
+    }
+
+    // 2. Check if AutoDeploy is enabled globally
+    const autodeploy = Database.getAutoDeploySettings();
+    if (!autodeploy.autodeploy_enabled) {
+      return { allowed: false, reason: 'AutoDeploy is currently disabled. Please contact an administrator to deploy your instance.' };
+    }
+
+    // 3. Check if overall node slots are exhausted
+    if (autodeploy.available_slots <= 0) {
+      return { allowed: false, reason: 'All node VPS deployment slots are currently exhausted. Please contact an administrator.' };
+    }
+
+    // 4. Check if user has an assigned slot allocated by admin
+    const assignedSlots = user.assigned_slots || 0;
+    if (assignedSlots < 1) {
+      return {
+        allowed: false,
+        reason: 'No VPS deployment slot assigned to your account. Please contact an administrator to allocate a slot.'
+      };
+    }
+
+    return { allowed: true };
   },
 
   // Settings

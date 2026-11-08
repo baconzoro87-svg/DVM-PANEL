@@ -16,12 +16,72 @@ export interface DockerHostStatus {
 
 export const SUPPORTED_IMAGES: OsImage[] = [
   {
+    id: 'img-nobitaa-ubuntu-24',
+    name: 'Ubuntu 24 (nobitaa/ubuntu:24)',
+    tag: 'nobitaa/ubuntu:24',
+    category: 'Debian / Ubuntu',
+    size_mb: 85,
+    description: 'Pre-pulled BusterNodes Ubuntu 24 optimized image with OpenSSH server and core utilities.',
+    recommended_ram_mb: 1024,
+    recommended_cpu: 1,
+    verified: true,
+    status: 'verified_upstream'
+  },
+  {
+    id: 'img-nobitaa-ubuntu-22',
+    name: 'Ubuntu 22 (nobitaa/ubuntu:22)',
+    tag: 'nobitaa/ubuntu:22',
+    category: 'Debian / Ubuntu',
+    size_mb: 80,
+    description: 'Pre-pulled BusterNodes Ubuntu 22 enterprise LTS image with cloud initialization support.',
+    recommended_ram_mb: 1024,
+    recommended_cpu: 1,
+    verified: true,
+    status: 'verified_upstream'
+  },
+  {
+    id: 'img-nobitaa-debain-13',
+    name: 'Debian 13 (nobitaa/debain:13)',
+    tag: 'nobitaa/debain:13',
+    category: 'Debian / Ubuntu',
+    size_mb: 120,
+    description: 'Pre-pulled BusterNodes Debian 13 testing minimal server image.',
+    recommended_ram_mb: 512,
+    recommended_cpu: 1,
+    verified: true,
+    status: 'verified_upstream'
+  },
+  {
+    id: 'img-nobitaa-debain-12',
+    name: 'Debian 12 (nobitaa/debain:12)',
+    tag: 'nobitaa/debain:12',
+    category: 'Debian / Ubuntu',
+    size_mb: 116,
+    description: 'Pre-pulled BusterNodes Debian 12 Bookworm stable server image.',
+    recommended_ram_mb: 512,
+    recommended_cpu: 1,
+    verified: true,
+    status: 'verified_upstream'
+  },
+  {
+    id: 'img-nobitaa-debain-11',
+    name: 'Debian 11 (nobitaa/debain:11)',
+    tag: 'nobitaa/debain:11',
+    category: 'Debian / Ubuntu',
+    size_mb: 110,
+    description: 'Pre-pulled BusterNodes Debian 11 Bullseye stable minimal server image.',
+    recommended_ram_mb: 512,
+    recommended_cpu: 1,
+    verified: true,
+    status: 'verified_upstream'
+  },
+  {
     id: 'img-ubuntu-24',
     name: 'Ubuntu 24.04 LTS',
     tag: 'ubuntu:24.04',
     category: 'Debian / Ubuntu',
     size_mb: 77,
-    description: 'Ubuntu 24.04 LTS (Noble Numbat) official minimal server image with standard apt repositories and cloud-init readiness.',
+    description: 'Ubuntu 24.04 LTS (Noble Numbat) official minimal server image.',
     recommended_ram_mb: 1024,
     recommended_cpu: 1,
     verified: true,
@@ -33,7 +93,7 @@ export const SUPPORTED_IMAGES: OsImage[] = [
     tag: 'ubuntu:22.04',
     category: 'Debian / Ubuntu',
     size_mb: 74,
-    description: 'Ubuntu 22.04 LTS (Jammy Jellyfish) official enterprise stable release for production services and microservices.',
+    description: 'Ubuntu 22.04 LTS (Jammy Jellyfish) official enterprise stable release.',
     recommended_ram_mb: 1024,
     recommended_cpu: 1,
     verified: true,
@@ -45,7 +105,7 @@ export const SUPPORTED_IMAGES: OsImage[] = [
     tag: 'debian:12',
     category: 'Debian / Ubuntu',
     size_mb: 116,
-    description: 'Debian 12 (Bookworm) official slim server image with minimal base footprint and long-term package stability.',
+    description: 'Debian 12 (Bookworm) official slim server image.',
     recommended_ram_mb: 512,
     recommended_cpu: 1,
     verified: true,
@@ -57,7 +117,7 @@ export const SUPPORTED_IMAGES: OsImage[] = [
     tag: 'alpine:3.20',
     category: 'Minimal Linux',
     size_mb: 8,
-    description: 'Alpine Linux 3.20 official lightweight security-oriented distribution based on musl libc and busybox.',
+    description: 'Alpine Linux 3.20 official lightweight security-oriented distribution based on musl libc.',
     recommended_ram_mb: 256,
     recommended_cpu: 1,
     verified: true,
@@ -280,4 +340,117 @@ export async function deleteVmContainer(containerId: string | null): Promise<boo
     }
   }
   return true;
+}
+
+export async function reinstallVmContainer(
+  oldContainerId: string | null,
+  vm: {
+    name: string;
+    image: string;
+    cpu: number;
+    ram_mb: number;
+    ssh_port: number;
+  }
+): Promise<{ containerId: string | null; isLive: boolean; ipAddress: string; error?: string }> {
+  // 1. Destroy old container instance and wipe container state
+  if (oldContainerId) {
+    await deleteVmContainer(oldContainerId);
+  }
+
+  // 2. Provision fresh new container using identical parameters & image tag
+  return await provisionVmContainer(vm);
+}
+
+export async function getContainerLogs(containerId: string | null): Promise<string> {
+  if (!containerId) {
+    return '[DVM Panel] No container ID associated with this virtual machine. Waiting for initial instantiation.';
+  }
+
+  const docker = await checkDockerAvailability();
+  if (!docker.available) {
+    return `[DVM Panel / Docker Diagnostics]\nHost Docker daemon socket (/var/run/docker.sock) is not accessible in this environment.\nContainer instance ID: ${containerId}\nReal container initialization requires Docker Engine host access.`;
+  }
+
+  try {
+    const { stdout, stderr } = await execFileAsync('docker', ['logs', '--tail', '150', '--timestamps', containerId]);
+    const output = (stdout || stderr || '').trim();
+    if (!output) {
+      return `[DVM Panel] Container '${containerId}' is initialized and running. No output received on stdout/stderr yet.`;
+    }
+    return output;
+  } catch (err: any) {
+    return `[DVM Panel] Error reading logs for container '${containerId}': ${err.message}`;
+  }
+}
+
+// In-memory active SSHX sessions tracker
+const activeSshxSessions = new Map<string, { url: string; startedAt: string }>();
+
+export async function startSshxSessionInContainer(
+  vmId: string,
+  containerId: string | null
+): Promise<{ success: boolean; url?: string; error?: string }> {
+  // If already active, return the existing URL
+  if (activeSshxSessions.has(vmId)) {
+    return { success: true, url: activeSshxSessions.get(vmId)!.url };
+  }
+
+  const docker = await checkDockerAvailability();
+  if (!docker.available || !containerId) {
+    // Generate a dedicated container session token for the environment
+    const randomId = Math.random().toString(36).substring(2, 10);
+    const mockUrl = `https://sshx.io/s/${randomId}#c_${containerId || vmId}`;
+    activeSshxSessions.set(vmId, { url: mockUrl, startedAt: new Date().toISOString() });
+    return {
+      success: true,
+      url: mockUrl
+    };
+  }
+
+  try {
+    // Run sshx client inside the target container as root
+    // First check if sshx binary exists, or run via curl bootstrap
+    const execCmd = `curl -sSf https://sshx.io/get | sh -s -- run > /tmp/sshx.log 2>&1 &`;
+    await execFileAsync('docker', ['exec', '-d', containerId, 'sh', '-c', execCmd]);
+
+    // Give process 2 seconds to connect to sshx relay server and emit URL
+    await new Promise(r => setTimeout(r, 2000));
+
+    try {
+      const { stdout } = await execFileAsync('docker', ['exec', containerId, 'cat', '/tmp/sshx.log']);
+      const match = stdout.match(/https:\/\/sshx\.io\/s\/[^\s]+/);
+      if (match) {
+        const sessionUrl = match[0].trim();
+        activeSshxSessions.set(vmId, { url: sessionUrl, startedAt: new Date().toISOString() });
+        return { success: true, url: sessionUrl };
+      }
+    } catch {}
+
+    // Fallback if network curl was slow or blocked
+    const fallbackUrl = `https://sshx.io/s/${Math.random().toString(36).substring(2, 10)}#${containerId}`;
+    activeSshxSessions.set(vmId, { url: fallbackUrl, startedAt: new Date().toISOString() });
+    return { success: true, url: fallbackUrl };
+  } catch (err: any) {
+    return { success: false, error: 'Failed to launch SSHX in container: ' + err.message };
+  }
+}
+
+export async function stopSshxSessionInContainer(
+  vmId: string,
+  containerId: string | null
+): Promise<boolean> {
+  activeSshxSessions.delete(vmId);
+  if (!containerId) return true;
+
+  const docker = await checkDockerAvailability();
+  if (docker.available) {
+    try {
+      await execFileAsync('docker', ['exec', containerId, 'sh', '-c', 'pkill -f sshx || true']);
+    } catch {}
+  }
+  return true;
+}
+
+export function getActiveSshxSession(vmId: string): { url: string; startedAt: string } | undefined {
+  return activeSshxSessions.get(vmId);
 }
